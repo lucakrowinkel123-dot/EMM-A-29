@@ -250,6 +250,7 @@ public Program ()
     { secondsPerTick = 100.0 / 60.0; echoFrequency = 1; }
 
     LoadState();
+    SanitizeDockingStateOnRestart();
     InitializeMineIndicatorSensors();
     Echo("Ready.");
     Runtime.UpdateFrequency = tickSpeed;
@@ -1287,6 +1288,39 @@ void RecompileFlightSystems()
     allThrusters = GetBlocks<IMyThrust>().FindAll(b => HasMinerTag(b));
     thrust = new ThrusterControl(rc, tickSpeed, allThrusters);
     gyros = new GyroControl(rc, tickSpeed, allGyros);
+}
+
+// After a recompile, the saved docking state may be stale or inconsistent with the
+// physical connector/merger state. If the connector is still locked we know the miner
+// never actually separated, so reset to the docked idle state.  If the connector is
+// not connected but the saved state says we were still in a pre-undock phase (e.g.
+// the path runner fired StartUndock in the same tick that SaveStateProgressOnly last
+// ran, so the new UndockingRecompile state was not yet written to Storage), abort the
+// phantom undock by forcing dockingState to None and disabling autopilot so the miner
+// does not fly off on its own.
+void SanitizeDockingStateOnRestart()
+{
+    if (dockingState == DockingState.None)
+        return;
+
+    bool connectorLocked = minerConnector != null &&
+                           minerConnector.Status == MyShipConnectorStatus.Connected;
+
+    if (connectorLocked)
+    {
+        // Physically still docked — whatever in-progress state was saved is stale.
+        dockingState = DockingState.None;
+        undockRecompileTicksRemaining = 0;
+        dockMergeReadyTicks = 0;
+        dockConnectRetryTicks = 0;
+        dockConnectRecompileTicksRemaining = 0;
+        dockConnectRecompileArmed = false;
+        autopilotEnabled = false;
+        hasTarget = false;
+        activeMaxSpeed = 0;
+        ApplyDockedPowerState();
+        Echo("Restart: connector locked — docking state reset to idle.");
+    }
 }
 
 void StartUndock()
