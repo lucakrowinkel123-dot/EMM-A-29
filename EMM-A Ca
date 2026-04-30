@@ -42,6 +42,9 @@ UpdateFrequency tickSpeed     = UpdateFrequency.Update1;
 double maxSpeed               = 25;
 double arrivalTolerance       = 2.5;
 double orientationToleranceDeg = 1.0;
+double flipBurnSafetyFactor = 2.0;
+double flipBurnTurnRateDegPerSec = 20.0;
+double flipBurnTurnAlignDeg = 7.0;
 string pathTimerTag           = "Carrier Path";
 double TOFFR = 0;
 double TOFFU = 0;
@@ -85,6 +88,15 @@ bool autopilotEnabled    = false;
 Vector3D desiredForward  = Vector3D.Zero;
 Vector3D desiredUp       = Vector3D.Zero;
 double activeMaxSpeed    = 0;
+
+enum FlipBurnState
+{
+    HoldAndTurn,
+    Accelerate,
+    FlipAndBurn,
+    FinalStop
+}
+FlipBurnState flipBurnState = FlipBurnState.HoldAndTurn;
 
 bool pathMode            = false;
 bool pathPaused          = false;
@@ -310,6 +322,7 @@ void WriteEcho()
         sb.AppendLine($"Target: {targetPosition.ToString("0.00")}");
     else
         sb.AppendLine("Target: <none>");
+    sb.AppendLine("FlipBurn: " + flipBurnState.ToString());
     sb.AppendLine($"Runtime (last tick): {Runtime.LastRunTimeMs:0.000} ms");
     sb.AppendLine($"Runtime peak (last minute): {runtimePeakLastMinuteMs:0.000} ms");
     Echo(sb.ToString());
@@ -334,37 +347,85 @@ void Move()
     Vector3D worldOffset = GetTargetOffsetWorld();
     Vector3D position    = rc.GetPosition() + worldOffset;
     Vector3D toTarget    = targetPosition - position;
+    double distance      = toTarget.Length();
 
-    Vector3D forward = desiredForward;
-    if (forward == Vector3D.Zero && toTarget.LengthSquared() > 0.001)
-        forward = Vector3D.Normalize(toTarget);
-
+    Vector3D travelDir = toTarget.LengthSquared() > 0.001 ? Vector3D.Normalize(toTarget) : rc.WorldMatrix.Forward;
     Vector3D up = desiredUp;
     if (up == Vector3D.Zero)
     {
         Vector3D gravity = rc.GetNaturalGravity();
-        if (gravity.LengthSquared() > 0.001)
-            up = Vector3D.Normalize(-gravity);
-        else
-            up = rc.WorldMatrix.Up;
+        up = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
     }
 
-    gyros.FaceVectors(forward, up);
-
     double tolerance = Math.Max(0.05, arrivalTolerance);
-    bool atPosition  = toTarget.LengthSquared() < tolerance * tolerance;
-    bool aligned     = IsOrientationAligned(forward, up, orientationToleranceDeg);
-    if (atPosition)
+    double maxSpeedNow = activeMaxSpeed > 0 ? activeMaxSpeed : maxSpeed;
+    double speed = rc.GetShipSpeed();
+
+    double decel = Math.Max(0.1, GetForwardAcceleration());
+    double stoppingDistance = (speed * speed) / (2.0 * decel);
+    double safeStoppingDistance = stoppingDistance * Math.Max(1.0, flipBurnSafetyFactor);
+    double turnRateRad = Math.Max(0.05, flipBurnTurnRateDegPerSec * Math.PI / 180.0);
+    double turnTime = Math.PI / turnRateRad;
+    double turnDistance = speed * turnTime;
+    double flipDistance = safeStoppingDistance + turnDistance;
+
+    if (distance <= tolerance && speed < 0.25)
+        flipBurnState = FlipBurnState.FinalStop;
+
+    if (flipBurnState == FlipBurnState.HoldAndTurn)
     {
+        gyros.FaceVectors(travelDir, up);
         thrust.Reset();
-        if (aligned)
-            gyros.Reset();
+        if (IsOrientationAligned(travelDir, up, flipBurnTurnAlignDeg))
+            flipBurnState = FlipBurnState.Accelerate;
         return;
     }
 
-    double maxSpeedNow = activeMaxSpeed > 0 ? activeMaxSpeed : maxSpeed;
-    Vector3D rcTarget  = targetPosition - worldOffset;
-    thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeedNow));
+    if (flipBurnState == FlipBurnState.Accelerate)
+    {
+        gyros.FaceVectors(travelDir, up);
+        Vector3D rcTarget = targetPosition - worldOffset;
+        thrust.ApplyAccel(thrust.ControlPosition(rcTarget, Vector3D.Zero, maxSpeedNow));
+        if (distance <= flipDistance)
+            flipBurnState = FlipBurnState.FlipAndBurn;
+        return;
+    }
+
+    if (flipBurnState == FlipBurnState.FlipAndBurn)
+    {
+        Vector3D burnForward = -travelDir;
+        gyros.FaceVectors(burnForward, up);
+
+        bool turned = IsOrientationAligned(burnForward, up, flipBurnTurnAlignDeg);
+        if (turned)
+            thrust.ApplyAccel(thrust.ControlVelocity(Vector3D.Zero));
+        else
+            thrust.Reset();
+
+        if (distance <= tolerance && speed < 0.5)
+            flipBurnState = FlipBurnState.FinalStop;
+        return;
+    }
+
+    gyros.FaceVectors(desiredForward != Vector3D.Zero ? desiredForward : rc.WorldMatrix.Forward, up);
+    thrust.Reset();
+    if (IsOrientationAligned(desiredForward != Vector3D.Zero ? desiredForward : rc.WorldMatrix.Forward, up, orientationToleranceDeg))
+        gyros.Reset();
+}
+
+double GetForwardAcceleration()
+{
+    double forwardThrust = 0;
+    Vector3D fwd = rc.WorldMatrix.Forward;
+    for (int i = 0; i < allThrusters.Count; i++)
+    {
+        var t = allThrusters[i];
+        double dot = Vector3D.Dot(t.WorldMatrix.Forward, fwd);
+        if (dot > 0.85)
+            forwardThrust += t.MaxEffectiveThrust * dot;
+    }
+    double mass = Math.Max(1, rc.CalculateShipMass().TotalMass);
+    return Math.Max(0.1, forwardThrust / mass);
 }
 
 Vector3D GetTargetOffsetWorld()
@@ -413,6 +474,7 @@ void RemoteCommand(string command)
         }
         hasTarget        = true;
         autopilotEnabled = true;
+        flipBurnState = FlipBurnState.HoldAndTurn;
         Runtime.UpdateFrequency = tickSpeed;
         WriteEcho();
         return;
@@ -497,6 +559,7 @@ void RemoteCommand(string command)
                 if (autopilotEnabled && hasTarget)
                 {
                     autopilotEnabled    = false;
+                    flipBurnState       = FlipBurnState.FinalStop;
                     pathPausedNavResume = true;
                     Echo("Path mode paused. Movement halted.");
                 }
@@ -694,6 +757,7 @@ void UpdateMineSequence()
         desiredUp = mineSavedUp;
         hasTarget = true;
         autopilotEnabled = true;
+        flipBurnState = FlipBurnState.HoldAndTurn;
         activeMaxSpeed = maxSpeed;
         mineSequenceState = MineSequenceState.ReturningToFrontApproach;
         Echo($"Mine: miner complete. Returning to front approach point for asteroid {mineAsteroidNum:D3}.");
@@ -1017,6 +1081,7 @@ bool ExecutePathRecord(string rawRecord)
         desiredUp        = up;
         hasTarget        = true;
         autopilotEnabled = true;
+        flipBurnState = FlipBurnState.HoldAndTurn;
         return true;
     }
 
@@ -1539,6 +1604,7 @@ void HandleGoTo(string argument)
     desiredUp        = savedUp;
     hasTarget        = true;
     autopilotEnabled = true;
+    flipBurnState = FlipBurnState.HoldAndTurn;
     Runtime.UpdateFrequency = tickSpeed;
     goToMode         = true;
     goToStage        = 1;
