@@ -399,14 +399,14 @@ void Move()
 }
 
 
-void StartFlipBurn(Vector3D gps)
+bool StartFlipBurn(Vector3D gps)
 {
     flipBurnTarget = gps;
     flipBurnLastDistance = Vector3D.Distance(rc.GetPosition(), flipBurnTarget);
     if (flipBurnLastDistance <= Math.Max(0, flipBurnArrivalBuffer))
     {
         CompleteFlipBurn($"FlipBurn: already within {flipBurnArrivalBuffer:0.0} m buffer. Complete.");
-        return;
+        return true;
     }
 
     autopilotEnabled = false;
@@ -421,6 +421,7 @@ void StartFlipBurn(Vector3D gps)
     flipBurnLastTriggerDistance = 0;
     Runtime.UpdateFrequency = tickSpeed;
     Echo($"FlipBurn: started toward {flipBurnTarget.ToString("0.00")}.");
+    return true;
 }
 
 void StopFlipBurn(bool resetControls = true)
@@ -450,12 +451,6 @@ void UpdateFlipBurn()
     flipBurnLastDistance = distance;
 
     if (distance <= Math.Max(0, flipBurnArrivalBuffer) && rc.GetShipVelocities().LinearVelocity.Length() <= 0.5)
-    {
-        CompleteFlipBurn("FlipBurn: complete within buffer.");
-        return;
-    }
-
-    if (distance <= Math.Max(0, flipBurnArrivalBuffer) && flipBurnStage != FlipBurnStage.Brake)
     {
         CompleteFlipBurn("FlipBurn: complete within buffer.");
         return;
@@ -2669,7 +2664,8 @@ class ThrusterControl
         foreach (IMyThrust t in thrusters)
         {
             if (!t.IsFunctional) continue;
-            double alignment = Vector3D.Dot(t.WorldMatrix.Forward, dir);
+            Vector3D forceDirection = -t.WorldMatrix.Forward;
+            double alignment = Vector3D.Dot(forceDirection, dir);
             if (alignment > 0)
                 total += t.MaxEffectiveThrust * alignment;
         }
@@ -2689,7 +2685,8 @@ class ThrusterControl
         foreach (IMyThrust t in thrusters)
         {
             if (!t.IsFunctional) continue;
-            double alignment = Vector3D.Dot(t.WorldMatrix.Forward, dir);
+            Vector3D forceDirection = -t.WorldMatrix.Forward;
+            double alignment = Vector3D.Dot(forceDirection, dir);
             if (alignment > 0.5)
                 t.ThrustOverridePercentage = pct;
             else
