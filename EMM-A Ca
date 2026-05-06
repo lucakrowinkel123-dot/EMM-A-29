@@ -27,8 +27,9 @@
 // setallopen   : set all asteroid status lines in Zone DB to "Open" (adds missing lines).
 // LoadAsteroid <n> : load the path records from the saved Asteroid record <n> (e.g. 002)
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
-// GoTo <n>         : approach saved Asteroid <n> from a safe side-point, then fly/align to saved
-//                    carrier pose while avoiding the asteroid bubble around the saved site.
+// GoTo <n>         : FlipBurn toward saved Asteroid <n> from a safe side-point, nav-finish
+//                    to that point if needed, then fly/align to saved carrier pose while
+//                    avoiding the asteroid bubble around the saved site.
 // Mine <n>         : orchestrates GoTo <n> -> LoadAsteroid <n> -> miner PathStart -> wait for miner
 //                    path completion broadcast -> move to front approach point and finish.
 // =====================================
@@ -67,6 +68,7 @@ string asteroidHeaderLine = "---------------------------------------------------
 double goToLeadDistanceMeters = 1000;
 double goToBubbleOffsetMeters = 150;
 double goToBubbleRadiusMeters = 750;
+double goToNavFinishDistanceMeters = 5;
 int fullAutoRetryTicks = 180; // retries when no valid Fullauto target is available
 double mineStationarySpeedMps = 0.20;
 int mineStationaryConfirmTicks = 30;
@@ -120,7 +122,7 @@ IMyTimerBlock _cachedPathTimer;
 IMyTimerBlock _cachedZoneDbTimer;
 
 bool goToMode = false;
-int goToStage = 0; // 1 = flying to safe side-point, 2 = final approach to saved carrier pose
+int goToStage = 0; // 1 = flip-burning to safe side-point, 2 = nav finishing side-point, 3 = final approach to saved carrier pose
 IMyBroadcastListener minerPathCompleteListener;
 
 enum MineSequenceState
@@ -1804,8 +1806,8 @@ void HandleGoTo(string argument)
     targetPosition   = chosenPoint;
     desiredForward   = Vector3D.Zero;
     desiredUp        = savedUp;
-    hasTarget        = true;
-    autopilotEnabled = true;
+    hasTarget        = false;
+    autopilotEnabled = false;
     Runtime.UpdateFrequency = tickSpeed;
     goToMode         = true;
     goToStage        = 1;
@@ -1815,38 +1817,78 @@ void HandleGoTo(string argument)
     pathRecords.Clear();
     pathIndex = 0;
 
+    _goToApproachPosition = chosenPoint;
     _goToFinalPosition = savedPos;
     _goToFinalForward  = savedForward;
     _goToFinalUp       = savedUp;
 
-    Echo($"GoTo: Asteroid {asteroidNum:D3} using {(frontIntersects ? "rear" : "front")} approach point.");
+    StartFlipBurn(chosenPoint);
+    Echo($"GoTo: Asteroid {asteroidNum:D3} flip-burning to {(frontIntersects ? "rear" : "front")} approach point.");
+    UpdateGoToRunner();
 }
 
+Vector3D _goToApproachPosition = Vector3D.Zero;
 Vector3D _goToFinalPosition = Vector3D.Zero;
 Vector3D _goToFinalForward  = Vector3D.Zero;
 Vector3D _goToFinalUp       = Vector3D.Zero;
 
 void UpdateGoToRunner()
 {
-    if (!goToMode || !autopilotEnabled || !hasTarget)
+    if (!goToMode)
         return;
 
-    if (goToStage == 1 && IsAtTargetPosition(targetPosition))
+    if (goToStage == 1)
     {
-        targetPosition = _goToFinalPosition;
-        desiredForward = _goToFinalForward;
-        desiredUp      = _goToFinalUp;
-        goToStage      = 2;
-        Echo("GoTo: side-point reached. Starting final approach.");
+        if (flipBurnActive)
+            return;
+
+        double approachDistance = Vector3D.Distance(rc.GetPosition() + GetTargetOffsetWorld(), _goToApproachPosition);
+        if (approachDistance > goToNavFinishDistanceMeters)
+        {
+            targetPosition   = _goToApproachPosition;
+            desiredForward   = Vector3D.Zero;
+            hasTarget        = true;
+            autopilotEnabled = true;
+            activeMaxSpeed   = 0;
+            goToStage        = 2;
+            Echo($"GoTo: FlipBurn complete {approachDistance:0.0} m from approach point; using nav to finish.");
+            return;
+        }
+
+        StartGoToFinalApproach();
         return;
     }
 
-    if (goToStage == 2 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
+    if (goToStage == 2)
+    {
+        if (!autopilotEnabled || !hasTarget)
+            return;
+
+        if (IsAtTargetPosition(_goToApproachPosition, goToNavFinishDistanceMeters))
+        {
+            StartGoToFinalApproach();
+            return;
+        }
+    }
+
+    if (goToStage == 3 && IsAtTargetPose(_goToFinalPosition, _goToFinalForward, _goToFinalUp))
     {
         goToMode      = false;
         goToStage     = 0;
         Echo("GoTo: final pose reached.");
     }
+}
+
+void StartGoToFinalApproach()
+{
+    targetPosition   = _goToFinalPosition;
+    desiredForward   = _goToFinalForward;
+    desiredUp        = _goToFinalUp;
+    hasTarget        = true;
+    autopilotEnabled = true;
+    activeMaxSpeed   = 0;
+    goToStage        = 3;
+    Echo("GoTo: side-point reached. Starting final approach.");
 }
 
 bool TryGetCarrierPoseFromZoneDb(int asteroidNum, out Vector3D pos, out Vector3D forward, out Vector3D up)
